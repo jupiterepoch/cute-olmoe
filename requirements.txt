@@ -1,0 +1,18 @@
+# Core dependencies for OlMoE implementation
+torch>=2.0.0
+numpy>=1.24.0
+
+# Utilities
+einops>=0.7.0  # For tensor reshaping operations
+tqdm>=4.65.0   # Progress bars (optional)
+
+# Testing
+pytest>=7.4.0
+
+# Optional: For real training
+transformers>=4.35.0  # For tokenizers
+datasets>=2.14.0      # For loading datasets
+tensorboard>=2.14.0   # For logging (optional)
+
+# Optional: For better performance
+triton>=2.1.0  # Kernel optimizations (optional)
