@@ -5,8 +5,27 @@ This file defines the configuration dataclass for OlMoE-1B-7B.
 Students will learn about model hyperparameters and architecture choices.
 """
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+# ---------------------------------------------------------------------------
+# HuggingFace compatibility: newer transformers versions store rope_theta
+# inside a rope_parameters dict rather than as a top-level attribute.
+# Patch the HF config class so that hf_config.rope_theta keeps working.
+# ---------------------------------------------------------------------------
+try:
+    from transformers import OlmoeConfig as _HFOlmoeConfig
+
+    if not hasattr(_HFOlmoeConfig, "rope_theta"):
+        def _rope_theta_getter(self):
+            rp = self.__dict__.get("rope_parameters")
+            if rp and isinstance(rp, dict):
+                return rp.get("rope_theta", 10000.0)
+            return 10000.0
+
+        _HFOlmoeConfig.rope_theta = property(_rope_theta_getter)
+except Exception:
+    pass
 
 
 @dataclass
@@ -52,29 +71,30 @@ class OlMoEConfig:
     eos_token_id: int = 2  # End of sequence token
 
     def __post_init__(self):
-        """
-        Validate configuration parameters.
-
-        TODO: Implement validation checks:
-        - Ensure hidden_size is divisible by num_attention_heads
-        - Ensure num_attention_heads >= num_key_value_heads
-        - Ensure num_experts_per_tok <= num_experts
-        - Validate that num_key_value_heads divides num_attention_heads evenly (for GQA)
-        """
-        # TODO: Add validation logic here
-        pass
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                f"hidden_size ({self.hidden_size}) must be divisible by "
+                f"num_attention_heads ({self.num_attention_heads})"
+            )
+        if self.num_attention_heads < self.num_key_value_heads:
+            raise ValueError(
+                f"num_attention_heads ({self.num_attention_heads}) must be >= "
+                f"num_key_value_heads ({self.num_key_value_heads})"
+            )
+        if self.num_experts_per_tok > self.num_experts:
+            raise ValueError(
+                f"num_experts_per_tok ({self.num_experts_per_tok}) must be <= "
+                f"num_experts ({self.num_experts})"
+            )
+        if self.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                f"num_attention_heads ({self.num_attention_heads}) must be divisible by "
+                f"num_key_value_heads ({self.num_key_value_heads})"
+            )
 
     @property
     def head_dim(self) -> int:
-        """
-        Calculate dimension of each attention head.
-
-        TODO: Implement this property
-        Returns:
-            int: hidden_size divided by num_attention_heads
-        """
-        # TODO: Return head dimension
-        pass
+        return self.hidden_size // self.num_attention_heads
 
 
 # Default configuration for OlMoE-1B-7B
@@ -85,13 +105,13 @@ def get_olmoe_1b_7b_config() -> OlMoEConfig:
     This is the reference configuration used in the paper.
     """
     return OlMoEConfig(
-        hidden_size=1024,
+        hidden_size=2048,
         num_hidden_layers=16,
         num_attention_heads=16,
         num_key_value_heads=16,
         intermediate_size=4096,
-        num_experts=8,
-        num_experts_per_tok=2,
+        num_experts=64,
+        num_experts_per_tok=8,
         vocab_size=50304,
-        max_position_embeddings=2048,
+        max_position_embeddings=4096,
     )

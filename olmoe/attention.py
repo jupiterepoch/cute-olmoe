@@ -21,22 +21,9 @@ from .utils import apply_rotary_pos_emb
 class OlMoEAttention(nn.Module):
     """
     Multi-Head Self-Attention with Grouped Query Attention (GQA).
-
-    GQA is a variant where multiple query heads share the same key/value heads.
-    This reduces the size of the KV cache during inference while maintaining quality.
-
-    Example:
-    - 16 query heads, 16 KV heads: Standard multi-head attention
-    - 16 query heads, 4 KV heads: Grouped query attention (4 queries per KV)
-    - 16 query heads, 1 KV head: Multi-query attention
     """
 
     def __init__(self, config: OlMoEConfig, layer_idx: Optional[int] = None):
-        """
-        Args:
-            config: Model configuration
-            layer_idx: Index of this layer (for caching)
-        """
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -47,27 +34,22 @@ class OlMoEAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.attention_dropout = config.attention_dropout
 
-        # Validate configuration
         if self.hidden_size % self.num_heads != 0:
             raise ValueError(
                 f"hidden_size ({self.hidden_size}) must be divisible by "
                 f"num_attention_heads ({self.num_heads})"
             )
 
-        # TODO: Initialize query, key, value, and output projection layers
-        # q_proj: hidden_size -> num_heads * head_dim
-        # k_proj: hidden_size -> num_key_value_heads * head_dim
-        # v_proj: hidden_size -> num_key_value_heads * head_dim
-        # o_proj: num_heads * head_dim -> hidden_size
-        # Use bias=False for all projections
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        self.q_proj = None  # TODO
-        self.k_proj = None  # TODO
-        self.v_proj = None  # TODO
-        self.o_proj = None  # TODO
-
-        # TODO: Initialize rotary embeddings
-        self.rotary_emb = None  # TODO: Create RotaryEmbedding instance
+        self.rotary_emb = RotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
 
     def _split_heads(
         self,
@@ -75,68 +57,30 @@ class OlMoEAttention(nn.Module):
         num_heads: int,
         attn_head_size: int
     ) -> torch.Tensor:
-        """
-        Split hidden dimension into attention heads.
+        """(batch, seq, hidden) -> (batch, heads, seq, head_dim)"""
+        batch_size, seq_len, _ = tensor.shape
+        tensor = tensor.view(batch_size, seq_len, num_heads, attn_head_size)
+        return tensor.transpose(1, 2)
 
-        Args:
-            tensor: Shape (batch_size, seq_len, hidden_size)
-            num_heads: Number of attention heads
-            attn_head_size: Size of each head
-
-        Returns:
-            Tensor of shape (batch_size, num_heads, seq_len, attn_head_size)
-
-        TODO: Implement head splitting
-        Steps:
-        1. Reshape to (batch_size, seq_len, num_heads, attn_head_size)
-        2. Transpose to (batch_size, num_heads, seq_len, attn_head_size)
-        """
-        # TODO: Split and transpose
-        pass
-
-    def _merge_heads(
-        self,
-        tensor: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Merge attention heads back into hidden dimension.
-
-        Args:
-            tensor: Shape (batch_size, num_heads, seq_len, attn_head_size)
-
-        Returns:
-            Tensor of shape (batch_size, seq_len, hidden_size)
-
-        TODO: Implement head merging
-        Steps:
-        1. Transpose to (batch_size, seq_len, num_heads, attn_head_size)
-        2. Reshape to (batch_size, seq_len, hidden_size)
-        """
-        # TODO: Transpose and merge
-        pass
+    def _merge_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        """(batch, heads, seq, head_dim) -> (batch, seq, hidden)"""
+        batch_size, num_heads, seq_len, head_dim = tensor.shape
+        tensor = tensor.transpose(1, 2).contiguous()
+        return tensor.view(batch_size, seq_len, num_heads * head_dim)
 
     def _repeat_kv(
         self,
         hidden_states: torch.Tensor,
         n_rep: int
     ) -> torch.Tensor:
-        """
-        Repeat key/value heads for grouped query attention.
-
-        If num_heads=16 and num_key_value_heads=4, we repeat each KV head 4 times.
-
-        Args:
-            hidden_states: Shape (batch, num_key_value_heads, seq_len, head_dim)
-            n_rep: Number of repetitions (num_key_value_groups)
-
-        Returns:
-            Shape (batch, num_heads, seq_len, head_dim)
-
-        TODO: Implement KV head repetition
-        Hint: Use repeat_interleave or expand
-        """
-        # TODO: Repeat KV heads
-        pass
+        """Repeat KV heads for GQA: (batch, kv_heads, seq, dim) -> (batch, heads, seq, dim)"""
+        if n_rep == 1:
+            return hidden_states
+        batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
+        hidden_states = hidden_states[:, :, None, :, :].expand(
+            batch, num_kv_heads, n_rep, seq_len, head_dim
+        )
+        return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
 
     def forward(
         self,
@@ -147,80 +91,79 @@ class OlMoEAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        """
-        Forward pass of multi-head attention.
-
-        Args:
-            hidden_states: Input of shape (batch_size, seq_len, hidden_size)
-            attention_mask: Mask of shape (batch_size, 1, seq_len, seq_len)
-            position_ids: Position indices for RoPE
-            past_key_value: Cached (key, value) from previous step
-            output_attentions: Whether to return attention weights
-            use_cache: Whether to return key/value for caching
-
-        Returns:
-            Tuple of (output, attention_weights, past_key_value)
-
-        TODO: Implement attention forward pass
-        Steps:
-        1. Project to queries, keys, values using q_proj, k_proj, v_proj
-        2. Split into attention heads
-        3. Apply rotary embeddings to queries and keys
-        4. Optionally concatenate with cached past_key_value
-        5. Repeat key/value heads if using GQA
-        6. Compute attention scores: Q @ K^T / sqrt(head_dim)
-        7. Apply causal mask
-        8. Softmax to get attention weights
-        9. Apply attention dropout (if training)
-        10. Compute weighted sum: attention_weights @ V
-        11. Merge heads
-        12. Project output using o_proj
-        """
         batch_size, seq_len, _ = hidden_states.shape
 
-        # TODO: Project to Q, K, V
-        # query_states = self.q_proj(hidden_states)
-        # key_states = self.k_proj(hidden_states)
-        # value_states = self.v_proj(hidden_states)
+        # Project to Q, K, V
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
 
-        # TODO: Split into attention heads
-        # query_states = self._split_heads(query_states, self.num_heads, self.head_dim)
-        # key_states = self._split_heads(key_states, self.num_key_value_heads, self.head_dim)
-        # value_states = self._split_heads(value_states, self.num_key_value_heads, self.head_dim)
+        # Split into heads
+        query_states = self._split_heads(query_states, self.num_heads, self.head_dim)
+        key_states = self._split_heads(key_states, self.num_key_value_heads, self.head_dim)
+        value_states = self._split_heads(value_states, self.num_key_value_heads, self.head_dim)
 
-        # TODO: Apply RoPE
-        # cos, sin = self.rotary_emb(value_states, seq_len)
-        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # Determine total kv length for RoPE frequency table
+        past_len = past_key_value[0].shape[-2] if past_key_value is not None else 0
+        kv_seq_len = past_len + seq_len
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
-        # TODO: Handle past_key_value caching
-        # if past_key_value is not None:
-        #     key_states = torch.cat([past_key_value[0], key_states], dim=2)
-        #     value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        # Build position_ids for current tokens if not provided
+        if position_ids is None:
+            position_ids = torch.arange(past_len, past_len + seq_len, device=hidden_states.device).unsqueeze(0)
 
-        # TODO: Repeat KV heads for GQA
-        # key_states = self._repeat_kv(key_states, self.num_key_value_groups)
-        # value_states = self._repeat_kv(value_states, self.num_key_value_groups)
+        # Apply RoPE only to the current tokens (at their absolute positions)
+        # The cached keys were already RoPE-d when originally computed
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        # TODO: Compute attention scores
-        # attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # Concatenate with past KV cache
+        if past_key_value is not None:
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
-        # TODO: Apply attention mask
-        # if attention_mask is not None:
-        #     attn_weights = attn_weights + attention_mask
+        present_key_value = (key_states, value_states) if use_cache else None
 
-        # TODO: Softmax and dropout
-        # attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # Repeat KV heads for GQA
+        key_states = self._repeat_kv(key_states, self.num_key_value_groups)
+        value_states = self._repeat_kv(value_states, self.num_key_value_groups)
 
-        # TODO: Apply attention to values
-        # attn_output = torch.matmul(attn_weights, value_states)
+        # Attention scores: (batch, heads, seq_len, kv_seq_len)
+        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        # TODO: Merge heads and project output
-        # attn_output = self._merge_heads(attn_output)
-        # attn_output = self.o_proj(attn_output)
+        # Always apply an internal causal mask to prevent future-token leakage
+        total_kv_len = key_states.shape[-2]
+        internal_causal = torch.triu(
+            torch.full((seq_len, total_kv_len), float("-inf"), dtype=attn_weights.dtype, device=attn_weights.device),
+            diagonal=past_len + 1,
+        )
+        attn_weights = attn_weights + internal_causal.unsqueeze(0).unsqueeze(0)
 
-        # TODO: Return output, attention weights (if requested), and cache
-        pass
+        # Apply optional external mask (e.g. padding mask from model)
+        if attention_mask is not None:
+            if attention_mask.dtype == torch.bool:
+                # Bool mask: True = mask this position; convert to float additive mask
+                float_mask = torch.zeros_like(attn_weights)
+                attn_weights = attn_weights + float_mask.masked_fill(
+                    attention_mask.expand_as(attn_weights), float("-inf")
+                )
+            else:
+                attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
+
+        # Softmax and dropout
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+
+        # Weighted sum over values
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        # Merge heads and project
+        attn_output = self._merge_heads(attn_output)
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, present_key_value
 
 
 def _make_causal_mask(
@@ -232,19 +175,17 @@ def _make_causal_mask(
     """
     Create causal (lower triangular) attention mask.
 
-    This ensures each position can only attend to earlier positions.
-
-    Args:
-        input_shape: (batch_size, seq_len)
-        dtype: Data type for the mask
-        device: Device to create mask on
-        past_key_values_length: Length of cached past keys
-
-    Returns:
-        Causal mask of shape (batch_size, 1, seq_len, seq_len + past_key_values_length)
-
-    TODO: Implement causal mask creation
-    Hint: Use torch.triu to create upper triangular mask, then subtract from large negative value
+    Returns mask of shape (batch_size, 1, seq_len, seq_len + past_key_values_length)
+    with 0 for attended positions and -inf for masked positions.
     """
-    # TODO: Create causal attention mask
-    pass
+    batch_size, seq_len = input_shape
+    total_len = seq_len + past_key_values_length
+
+    # Upper triangular mask (positions that should be masked = True)
+    mask = torch.full((seq_len, total_len), float("-inf"), dtype=dtype, device=device)
+    mask_cond = torch.arange(total_len, device=device)
+    # Position i can attend to positions <= i + past_key_values_length
+    row_indices = torch.arange(seq_len, device=device).unsqueeze(1) + past_key_values_length
+    mask = torch.where(mask_cond.unsqueeze(0) <= row_indices, torch.zeros_like(mask), mask)
+
+    return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, total_len)

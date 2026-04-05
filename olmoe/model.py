@@ -6,6 +6,7 @@ This file combines all components into the complete OlMoE language model.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
 
@@ -20,14 +21,6 @@ from .utils import RMSNorm
 class OlMoEOutput:
     """
     Output of OlMoE model.
-
-    Attributes:
-        logits: Language modeling logits (batch, seq_len, vocab_size)
-        loss: Optional language modeling loss
-        aux_loss: MoE load balancing auxiliary loss
-        past_key_values: Cached key/value states for generation
-        hidden_states: All layer hidden states (if output_hidden_states=True)
-        attentions: All attention weights (if output_attentions=True)
     """
     logits: torch.Tensor
     loss: Optional[torch.Tensor] = None
@@ -39,39 +32,19 @@ class OlMoEOutput:
 
 class OlMoEDecoderLayer(nn.Module):
     """
-    Single transformer decoder layer.
+    Single transformer decoder layer (Pre-LN architecture).
 
-    Architecture:
-        Input
-        ↓
-        LayerNorm → Attention → Residual
-        ↓
-        LayerNorm → MoE → Residual
-        ↓
-        Output
-
-    This is the "Pre-LN" (pre-normalization) architecture.
+    Input -> LayerNorm -> Attention -> Residual -> LayerNorm -> MoE -> Residual -> Output
     """
 
     def __init__(self, config: OlMoEConfig, layer_idx: int):
-        """
-        Args:
-            config: Model configuration
-            layer_idx: Index of this layer
-        """
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        # TODO: Initialize components
-        # 1. self_attn: OlMoEAttention
-        # 2. mlp: OlMoEMoEBlock
-        # 3. input_layernorm: RMSNorm (before attention)
-        # 4. post_attention_layernorm: RMSNorm (before MoE)
-
-        self.self_attn = None  # TODO
-        self.mlp = None  # TODO
-        self.input_layernorm = None  # TODO
-        self.post_attention_layernorm = None  # TODO
+        self.self_attn = OlMoEAttention(config, layer_idx=layer_idx)
+        self.mlp = OlMoEMoEBlock(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -82,41 +55,31 @@ class OlMoEDecoderLayer(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple], Optional[torch.Tensor]]:
-        """
-        Forward pass through decoder layer.
+        # 1. Pre-LN attention
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, attn_weights, present_key_value = self.self_attn(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+        hidden_states = residual + hidden_states
 
-        Args:
-            hidden_states: Input (batch, seq_len, hidden_size)
-            attention_mask: Attention mask
-            position_ids: Position IDs for RoPE
-            past_key_value: Cached (key, value)
-            output_attentions: Whether to output attention weights
-            use_cache: Whether to cache key/values
+        # 2. Pre-LN MoE
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, aux_loss = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
 
-        Returns:
-            Tuple of (hidden_states, aux_loss, past_key_value, attention_weights)
-
-        TODO: Implement decoder layer forward pass
-        Steps:
-        1. Save residual
-        2. Apply input layer norm
-        3. Self-attention (returns output, attn_weights, past_kv)
-        4. Add residual connection
-        5. Save new residual
-        6. Apply post-attention layer norm
-        7. MoE layer (returns output, aux_loss)
-        8. Add residual connection
-        9. Return all outputs
-        """
-        # TODO: Implement decoder layer
-        pass
+        return hidden_states, aux_loss, present_key_value, attn_weights
 
 
 class OlMoEModel(nn.Module):
     """
-    OlMoE Transformer model (decoder only).
-
-    This is the core transformer without the language modeling head.
+    OlMoE Transformer model (decoder only, without LM head).
     """
 
     def __init__(self, config: OlMoEConfig):
@@ -125,15 +88,13 @@ class OlMoEModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.padding_idx = config.pad_token_id
 
-        # TODO: Initialize embeddings
-        self.embed_tokens = None  # TODO: OlMoEEmbedding
-
-        # TODO: Initialize transformer layers
-        # Create nn.ModuleList of OlMoEDecoderLayer
-        self.layers = None  # TODO
-
-        # TODO: Initialize final layer norm
-        self.norm = None  # TODO: RMSNorm
+        self.embed_tokens = OlMoEEmbedding(
+            config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
+        )
+        self.layers = nn.ModuleList(
+            [OlMoEDecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -145,55 +106,81 @@ class OlMoEModel(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> Tuple:
-        """
-        Forward pass through OlMoE model.
+        batch_size, seq_len = input_ids.shape
+        past_key_values_length = 0
+        if past_key_values is not None:
+            past_key_values_length = past_key_values[0][0].shape[2]
 
-        Args:
-            input_ids: Token IDs (batch, seq_len)
-            attention_mask: Attention mask (batch, seq_len)
-            position_ids: Position IDs
-            past_key_values: Cached KV states
-            use_cache: Whether to cache KV states
-            output_attentions: Whether to output attention weights
-            output_hidden_states: Whether to output all hidden states
+        # Embed tokens
+        hidden_states = self.embed_tokens(input_ids)
 
-        Returns:
-            Tuple of outputs
+        # Build causal mask
+        causal_mask = _make_causal_mask(
+            (batch_size, seq_len),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+            past_key_values_length=past_key_values_length,
+        )
+        if attention_mask is not None:
+            # Combine with padding mask if provided
+            # attention_mask: (batch, seq_len), 1=attend, 0=ignore
+            padding_mask = (1.0 - attention_mask[:, None, None, :].float()) * torch.finfo(hidden_states.dtype).min
+            causal_mask = causal_mask + padding_mask
 
-        TODO: Implement model forward pass
-        Steps:
-        1. Embed input tokens
-        2. Prepare attention mask (causal mask)
-        3. Prepare position IDs
-        4. Loop through all decoder layers:
-            - Forward through each layer
-            - Collect hidden states and attentions if requested
-            - Accumulate aux loss from MoE layers
-        5. Apply final layer norm
-        6. Return outputs
-        """
-        # TODO: Implement forward pass
-        pass
+        # Position IDs
+        if position_ids is None:
+            position_ids = torch.arange(
+                past_key_values_length, seq_len + past_key_values_length,
+                device=hidden_states.device
+            ).unsqueeze(0)
+
+        # Collect outputs
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+        present_key_values = [] if use_cache else None
+        total_aux_loss = torch.tensor(0.0, device=hidden_states.device)
+
+        for i, layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            past_kv = past_key_values[i] if past_key_values is not None else None
+
+            hidden_states, aux_loss, present_kv, attn_weights = layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_kv,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+
+            total_aux_loss = total_aux_loss + aux_loss
+
+            if use_cache:
+                present_key_values.append(present_kv)
+            if output_attentions:
+                all_attentions = all_attentions + (attn_weights,)
+
+        hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        return hidden_states, total_aux_loss, present_key_values, all_hidden_states, all_attentions
 
 
 class OlMoEForCausalLM(nn.Module):
     """
     OlMoE model with language modeling head.
-
-    This is the complete model for causal language modeling.
     """
 
     def __init__(self, config: OlMoEConfig):
         super().__init__()
         self.config = config
 
-        # TODO: Initialize base model
-        self.model = None  # TODO: OlMoEModel(config)
-
-        # TODO: Initialize language modeling head
-        # Linear layer: hidden_size -> vocab_size
-        # No bias needed
-        self.lm_head = None  # TODO
+        self.model = OlMoEModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
         self,
@@ -206,32 +193,38 @@ class OlMoEForCausalLM(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> OlMoEOutput:
-        """
-        Forward pass for causal language modeling.
+        hidden_states, aux_loss, present_key_values, all_hidden_states, all_attentions = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
 
-        Args:
-            input_ids: Token IDs (batch, seq_len)
-            attention_mask: Attention mask
-            position_ids: Position IDs
-            past_key_values: Cached KV states
-            labels: Target token IDs for computing loss
-            use_cache: Whether to cache KV
-            output_attentions: Whether to output attention weights
-            output_hidden_states: Whether to output hidden states
+        logits = self.lm_head(hidden_states)
 
-        Returns:
-            OlMoEOutput with logits and optional loss
+        loss = None
+        if labels is not None:
+            # Shift for causal LM: predict token i+1 from token i
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, self.config.vocab_size),
+                shift_labels.view(-1),
+            )
+            # Add MoE auxiliary loss
+            loss = loss + aux_loss
 
-        TODO: Implement language modeling forward pass
-        Steps:
-        1. Forward through base model
-        2. Project hidden states to vocabulary: lm_head(hidden_states)
-        3. If labels provided, compute cross-entropy loss
-        4. Add aux_loss to total loss (weighted)
-        5. Return OlMoEOutput
-        """
-        # TODO: Implement forward pass
-        pass
+        return OlMoEOutput(
+            logits=logits,
+            loss=loss,
+            aux_loss=aux_loss,
+            past_key_values=present_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+        )
 
     def generate(
         self,
@@ -240,47 +233,33 @@ class OlMoEForCausalLM(nn.Module):
         temperature: float = 1.0,
         top_k: int = 50,
     ) -> torch.Tensor:
-        """
-        Generate text autoregressively.
+        """Generate text autoregressively."""
+        self.eval()
+        with torch.no_grad():
+            for _ in range(max_length - input_ids.shape[1]):
+                output = self(input_ids)
+                next_logits = output.logits[:, -1, :]  # (batch, vocab)
 
-        Args:
-            input_ids: Starting token IDs (batch, seq_len)
-            max_length: Maximum total length
-            temperature: Sampling temperature
-            top_k: Top-k sampling
+                # Apply temperature
+                next_logits = next_logits / temperature
 
-        Returns:
-            Generated token IDs
+                # Top-k filtering
+                if top_k > 0:
+                    values, _ = torch.topk(next_logits, top_k)
+                    threshold = values[:, -1].unsqueeze(-1)
+                    next_logits = next_logits.masked_fill(next_logits < threshold, float('-inf'))
 
-        TODO: (Optional) Implement generation
-        This is advanced - students can implement after completing forward pass.
+                # Sample
+                probs = F.softmax(next_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                input_ids = torch.cat([input_ids, next_token], dim=1)
 
-        Steps:
-        1. Loop for max_length - input_ids.shape[1] steps:
-            a. Forward pass to get logits
-            b. Take logits for last position
-            c. Apply temperature
-            d. Apply top-k filtering
-            e. Sample next token
-            f. Append to input_ids
-        2. Return generated sequence
-        """
-        # TODO: Implement generation (optional)
-        pass
+        return input_ids
 
 
 def create_olmoe_model(config: Optional[OlMoEConfig] = None) -> OlMoEForCausalLM:
-    """
-    Factory function to create OlMoE model.
-
-    Args:
-        config: Model configuration (if None, uses default)
-
-    Returns:
-        OlMoEForCausalLM model
-    """
+    """Factory function to create OlMoE model."""
     if config is None:
         from .config import get_olmoe_1b_7b_config
         config = get_olmoe_1b_7b_config()
-
     return OlMoEForCausalLM(config)

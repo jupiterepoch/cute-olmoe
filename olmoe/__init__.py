@@ -1,7 +1,7 @@
 """
-OlMoE: Mixture of Experts Language Model
+OlMoE: Mixture of Experts Language Model (Reference Implementation)
 
-This package implements OlMoE-1B-7B from scratch for educational purposes.
+This package implements OlMoE-1B-7B from scratch.
 """
 
 from .config import OlMoEConfig, get_olmoe_1b_7b_config

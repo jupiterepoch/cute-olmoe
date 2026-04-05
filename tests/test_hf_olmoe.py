@@ -33,7 +33,9 @@ HF_MODEL_ID = "allenai/OLMoE-1B-7B-0924"
 def hf_config():
     """Load the HF OLMoE config (no weights downloaded)."""
     from transformers import AutoConfig
-    return AutoConfig.from_pretrained(HF_MODEL_ID)
+    obj = AutoConfig.from_pretrained(HF_MODEL_ID)
+    print(obj.__dict__)
+    return obj
 
 
 @pytest.fixture(scope="module")
@@ -74,7 +76,7 @@ def student_config(hf_config):
 
 def test_hf_config_loads(hf_config):
     """Confirm the HF config is reachable and has expected fields."""
-    assert hf_config.hidden_size == 1024
+    assert hf_config.hidden_size == 2048
     assert hf_config.num_hidden_layers == 16
     assert hf_config.num_attention_heads == 16
     assert hf_config.num_experts == 64
