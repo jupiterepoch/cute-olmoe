@@ -151,10 +151,6 @@ def test_weight_transfer_attention(hf_model, student_config):
     """
     Transfer weights from one HF attention layer into the student's OlMoEAttention
     and verify that both produce numerically identical outputs.
-
-    NOTE: The HF OlmoeAttention has q_norm / k_norm layers that the student
-    implementation may not include.  If the student model lacks these norms
-    the numerical comparison is skipped (shapes are still validated).
     """
     from olmoe.attention import OlMoEAttention
 
@@ -168,20 +164,14 @@ def test_weight_transfer_attention(hf_model, student_config):
         student_attn.k_proj.weight.copy_(hf_attn.k_proj.weight)
         student_attn.v_proj.weight.copy_(hf_attn.v_proj.weight)
         student_attn.o_proj.weight.copy_(hf_attn.o_proj.weight)
-
-    has_norms = hasattr(student_attn, 'q_norm') and hasattr(student_attn, 'k_norm')
-    if has_norms:
-        with torch.no_grad():
-            student_attn.q_norm.weight.copy_(hf_attn.q_norm.weight)
-            student_attn.k_norm.weight.copy_(hf_attn.k_norm.weight)
+        student_attn.q_norm.weight.copy_(hf_attn.q_norm.weight)
+        student_attn.k_norm.weight.copy_(hf_attn.k_norm.weight)
 
     batch_size, seq_len = 1, 6
     torch.manual_seed(0)
     hidden_states = torch.randn(batch_size, seq_len, student_config.hidden_size)
 
     with torch.no_grad():
-        # HF forward — newer transformers requires position_embeddings (cos, sin)
-        # and attention_mask as positional arguments.
         position_ids = torch.arange(seq_len).unsqueeze(0)
         rotary_emb = hf_model.model.rotary_emb
         position_embeddings = rotary_emb(hidden_states, position_ids)
@@ -191,20 +181,14 @@ def test_weight_transfer_attention(hf_model, student_config):
             attention_mask=None,
         )
 
-        # Student forward
         student_out, _, _ = student_attn(hidden_states)
 
     assert student_out.shape == hf_out.shape, \
         f"Shape mismatch: student {student_out.shape} vs HF {hf_out.shape}"
 
-    if not has_norms:
-        print("  (student model lacks q_norm/k_norm — skipping numerical comparison)")
-        print("✓ Attention weight transfer shape check passed")
-        return
-
-    assert torch.allclose(student_out, hf_out, atol=1e-4), \
-        f"Max diff: {(student_out - hf_out).abs().max().item()}"
-    print("✓ Attention weight transfer + numerical match passed")
+    max_diff = (student_out - hf_out).abs().max().item()
+    assert max_diff < 1e-4, f"Max diff: {max_diff}"
+    print(f"✓ Attention weight transfer + numerical match passed (max diff: {max_diff:.2e})")
 
 
 def _build_hf_to_student_state_dict(hf_state, student_state, num_experts):
@@ -215,7 +199,8 @@ def _build_hf_to_student_state_dict(hf_state, student_state, num_experts):
     - ``model.layers.N.mlp.gate.weight`` → ``model.layers.N.mlp.moe.router.gate.weight``
     - HF fused 3-D ``experts.gate_up_proj`` → per-expert ``gate_proj.weight`` + ``up_proj.weight``
     - HF fused 3-D ``experts.down_proj`` → per-expert ``down_proj.weight``
-    - ``q_norm`` / ``k_norm`` transferred only when the student model has them
+    - All other keys (attention projections, ``q_norm``, ``k_norm``, layernorms, ``lm_head``)
+      match directly between HF and student
     """
     import re
     mapped: dict[str, torch.Tensor] = {}
@@ -263,13 +248,7 @@ def _build_hf_to_student_state_dict(hf_state, student_state, num_experts):
                 mapped[hf_key] = hf_val
             continue
 
-        # 5. q_norm / k_norm — only if student has them
-        if "q_norm" in hf_key or "k_norm" in hf_key:
-            if hf_key in student_state:
-                mapped[hf_key] = hf_val
-            continue
-
-        # 6. Direct match (layernorms, lm_head, attention projections, etc.)
+        # 5. Direct match (layernorms, q_norm/k_norm, lm_head, attention projections, etc.)
         if hf_key in student_state:
             mapped[hf_key] = hf_val
 
