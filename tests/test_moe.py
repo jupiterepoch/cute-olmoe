@@ -12,6 +12,7 @@ import importlib
 import types
 import torch
 import torch.nn.functional as F
+import pytest
 import sys
 import os
 
@@ -309,6 +310,78 @@ def test_moe_output():
 
     print("  (matches HF OlmoeSparseMoeBlock expert computation)")
     print("✓ MoE output test passed!")
+
+
+def test_moe_output_matches_hf_official_block():
+    """Direct parity check against HF OlmoeSparseMoeBlock forward.
+
+    We set ``norm_topk_prob=True`` so HF routing weights are normalized over the
+    selected top-k experts, matching this repository's student MoE convention.
+    """
+    hf = _try_import_hf()
+    if hf is None:
+        pytest.skip("transformers not installed")
+
+    _, _, HFMoeBlock, _, _ = hf
+
+    config = OlMoEConfig(
+        hidden_size=128,
+        intermediate_size=512,
+        num_experts=8,
+        num_experts_per_tok=2,
+    )
+    hf_cfg = _make_hf_config(
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        num_experts=config.num_experts,
+        num_experts_per_tok=config.num_experts_per_tok,
+        norm_topk_prob=True,
+    )
+
+    torch.manual_seed(42)
+    student_moe = OlMoESparseMoE(config).eval()
+    hf_block = HFMoeBlock(hf_cfg).eval()
+
+    # Copy student weights -> HF block
+    with torch.no_grad():
+        hf_block.gate.weight.copy_(student_moe.router.gate.weight)
+        for i in range(config.num_experts):
+            expert = student_moe.experts[i]
+            hf_block.experts.gate_up_proj.data[i] = torch.cat(
+                [expert.gate_proj.weight, expert.up_proj.weight], dim=0
+            )
+            hf_block.experts.down_proj.data[i] = expert.down_proj.weight
+
+    torch.manual_seed(0)
+    hidden_states = torch.randn(2, 10, config.hidden_size)
+
+    with torch.no_grad():
+        student_out, student_router_logits = student_moe(hidden_states)
+        hf_ret = hf_block(hidden_states)
+
+    if isinstance(hf_ret, tuple):
+        hf_out = hf_ret[0]
+        hf_router_logits = hf_ret[1] if len(hf_ret) > 1 else None
+    else:
+        hf_out = hf_ret
+        hf_router_logits = None
+
+    assert student_out.shape == hf_out.shape, \
+        f"Shape mismatch: student {student_out.shape} vs HF {hf_out.shape}"
+    assert torch.allclose(student_out, hf_out, atol=1e-5), \
+        f"Student MoE output differs from HF block (max diff {(student_out - hf_out).abs().max():.2e})"
+
+    # Router logits should match when exposed by the HF block.
+    if hf_router_logits is not None:
+        expected_shape = student_router_logits.shape
+        if hf_router_logits.dim() == 3:
+            hf_router_logits = hf_router_logits.view(-1, hf_router_logits.size(-1))
+        assert hf_router_logits.shape == expected_shape, \
+            f"Router logits shape mismatch: student {expected_shape} vs HF {hf_router_logits.shape}"
+        assert torch.allclose(student_router_logits, hf_router_logits, atol=1e-6), \
+            f"Router logits differ from HF block (max diff {(student_router_logits - hf_router_logits).abs().max():.2e})"
+
+    print("✓ Student MoE matches HF OlmoeSparseMoeBlock forward")
 
 
 def test_load_balancing():

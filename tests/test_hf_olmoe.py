@@ -317,18 +317,18 @@ def test_weight_transfer_full_model(hf_model, student_config):
     assert student_logits.shape == hf_logits.shape, \
         f"Logits shape mismatch: student {student_logits.shape} vs HF {hf_logits.shape}"
 
-    if not mapped:
-        print("  (No weights transferred — implement weight mapping to enable numerical check)")
-        print("✓ Full model forward shape check passed")
-        return
+    assert mapped, "No weights were transferred; numerical parity check is meaningless."
 
     coverage = len(mapped) / len(student_state) * 100
+    unexpected = set(mapped) - set(student_state)
     max_diff = (student_logits - hf_logits).abs().max().item()
     print(f"  Weight coverage: {coverage:.0f}%  Max logit difference: {max_diff:.6f}")
 
-    if missing:
-        print(f"  ({len(missing)} student params not transferred — "
-              "exact match not expected until all weights are mapped)")
+    assert not unexpected, f"Mapped contains unknown student keys: {sorted(unexpected)[:5]}"
+    assert not missing, (
+        f"{len(missing)} student params were not transferred; "
+        "full-model numerical parity requires complete weight mapping."
+    )
 
     assert max_diff < 1e-3, f"Logits differ too much: {max_diff}"
     print("✓ Full model weight transfer + numerical match passed")

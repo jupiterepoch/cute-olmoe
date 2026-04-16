@@ -129,6 +129,40 @@ def test_attention_causality():
     print("✓ Attention causality test passed!")
 
 
+def test_attention_internal_causality():
+    """Changing future tokens must not affect outputs at earlier positions."""
+    config = OlMoEConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+    )
+
+    attention = OlMoEAttention(config)
+    attention.eval()
+    seq_len = 6
+
+    torch.manual_seed(0)
+    hidden_states = torch.randn(1, seq_len, config.hidden_size)
+
+    with torch.no_grad():
+        ref_out, _, _ = attention(hidden_states)
+
+    for cutoff in range(seq_len - 1):
+        mutated = hidden_states.clone()
+        mutated[:, cutoff + 1:, :] = torch.randn_like(mutated[:, cutoff + 1:, :])
+        with torch.no_grad():
+            test_out, _, _ = attention(mutated)
+
+        assert torch.allclose(
+            ref_out[:, :cutoff + 1, :],
+            test_out[:, :cutoff + 1, :],
+            atol=1e-5,
+            rtol=1e-5,
+        ), f"Future-token mutation changed outputs at/before position {cutoff}"
+
+    print("✓ Attention internal causality test passed!")
+
+
 if __name__ == "__main__":
     print("Running attention tests...\n")
 
@@ -151,5 +185,10 @@ if __name__ == "__main__":
         test_attention_causality()
     except Exception as e:
         print(f"✗ Causality test failed: {e}\n")
+
+    try:
+        test_attention_internal_causality()
+    except Exception as e:
+        print(f"✗ Internal causality test failed: {e}\n")
 
     print("\nAll tests completed!")

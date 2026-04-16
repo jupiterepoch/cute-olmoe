@@ -122,14 +122,29 @@ def test_model_backward():
     # Backward pass
     loss.backward()
 
-    # Check that some parameters have gradients
-    params_with_grad = 0
+    # Check that critical paths receive gradients.
+    nonzero_grad_params = set()
     for name, param in model.named_parameters():
         if param.grad is not None and param.grad.abs().sum() > 0:
-            params_with_grad += 1
+            nonzero_grad_params.add(name)
 
-    assert params_with_grad > 0, "Some parameters should have gradients"
-    print(f"✓ Model backward test passed! {params_with_grad} parameters have gradients")
+    critical = [
+        "model.embed_tokens.embedding.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.mlp.moe.router.gate.weight",
+        "lm_head.weight",
+    ]
+    for name in critical:
+        assert name in nonzero_grad_params, f"Expected non-zero gradient for {name}"
+
+    expert_grad = any(
+        (param.grad is not None and param.grad.abs().sum() > 0)
+        for name, param in model.named_parameters()
+        if ".mlp.moe.experts." in name
+    )
+    assert expert_grad, "Expected at least one expert parameter to receive gradient"
+    print(f"✓ Model backward test passed! {len(nonzero_grad_params)} parameters have non-zero gradients")
 
 
 def test_parameter_count():
@@ -155,8 +170,10 @@ def test_parameter_count():
     print(f"  Trainable parameters: {trainable_params:,}")
     print(f"  Parameters in billions: {total_params / 1e9:.2f}B")
 
-    # For OlMoE-1B-7B, should be around 7B total parameters
-    assert total_params > 1e9, "Model should have at least 1B parameters"
+    # This specific test config should land near ~1.8B parameters.
+    assert 1_600_000_000 < total_params < 2_100_000_000, \
+        f"Unexpected parameter count for test config: {total_params}"
+    assert trainable_params == total_params, "All parameters should be trainable in this model"
 
 
 def test_model_factory():
@@ -190,6 +207,7 @@ def test_caching():
     model.eval()
 
     # First forward pass
+    torch.manual_seed(0)
     input_ids = torch.randint(0, config.vocab_size, (1, 5))
     output1 = model(input_ids, use_cache=True)
 
@@ -207,6 +225,21 @@ def test_caching():
 
     assert output2.logits.shape == (1, 1, config.vocab_size), \
         "Cached forward should work with single token"
+
+    # Validate cache correctness: cached decoding must match full recomputation.
+    full_input = torch.cat([input_ids, next_token], dim=1)
+    full_output = model(full_input, use_cache=False)
+    assert torch.allclose(
+        output2.logits[:, -1, :],
+        full_output.logits[:, -1, :],
+        atol=1e-5,
+        rtol=1e-4,
+    ), "Cached decoding logits differ from full forward logits for the same next token"
+
+    assert output2.past_key_values is not None, "Second cached pass should return updated KV cache"
+    for (k_prev, v_prev), (k_new, v_new) in zip(output1.past_key_values, output2.past_key_values):
+        assert k_new.shape[-2] == k_prev.shape[-2] + 1, "Key cache length should grow by 1 token"
+        assert v_new.shape[-2] == v_prev.shape[-2] + 1, "Value cache length should grow by 1 token"
 
     print("✓ KV caching test passed!")
 
