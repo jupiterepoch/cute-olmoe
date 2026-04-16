@@ -18,6 +18,16 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+if not torch.cuda.is_available():
+    pytest.skip("MoE tests require CUDA for grouped GEMM path", allow_module_level=True)
+if not torch.cuda.is_bf16_supported():
+    pytest.skip("MoE tests require CUDA bfloat16 support", allow_module_level=True)
+
+DEVICE = torch.device("cuda")
+DTYPE = torch.bfloat16
+ATOL = 1e-2
+RTOL = 1e-2
+
 from olmoe.config import OlMoEConfig
 
 # --- reference (solution) classes from the ``olmoe`` package ----------------
@@ -138,8 +148,8 @@ def test_router_shapes():
     )
 
     torch.manual_seed(42)
-    ref_router = RefRouter(config)
-    student_router = OlMoERouter(config)
+    ref_router = RefRouter(config).to(device=DEVICE, dtype=DTYPE)
+    student_router = OlMoERouter(config).to(device=DEVICE, dtype=DTYPE)
     student_router.load_state_dict(ref_router.state_dict())
 
     batch_size = 2
@@ -147,7 +157,7 @@ def test_router_shapes():
     tokens = batch_size * seq_len
 
     torch.manual_seed(0)
-    hidden_states = torch.randn(tokens, config.hidden_size)
+    hidden_states = torch.randn(tokens, config.hidden_size, device=DEVICE, dtype=DTYPE)
 
     ref_weights, ref_experts, ref_logits = ref_router(hidden_states)
     stu_weights, stu_experts, stu_logits = student_router(hidden_states)
@@ -170,11 +180,11 @@ def test_router_shapes():
         f"Expert indices out of range: [{stu_experts.min()}, {stu_experts.max()}]"
 
     # Must match the reference implementation exactly
-    assert torch.allclose(stu_logits, ref_logits, atol=1e-6), \
+    assert torch.allclose(stu_logits, ref_logits, atol=ATOL, rtol=RTOL), \
         f"Router logits differ from reference (max diff {(stu_logits - ref_logits).abs().max():.2e})"
     assert torch.equal(stu_experts, ref_experts), \
         "Selected experts differ from reference"
-    assert torch.allclose(stu_weights, ref_weights, atol=1e-6), \
+    assert torch.allclose(stu_weights, ref_weights, atol=ATOL, rtol=RTOL), \
         f"Routing weights differ from reference (max diff {(stu_weights - ref_weights).abs().max():.2e})"
 
     print("✓ Router shape test passed! (matches reference)")
@@ -188,10 +198,10 @@ def test_router_top_k():
         num_experts_per_tok=2,
     )
 
-    router = OlMoERouter(config)
+    router = OlMoERouter(config).to(device=DEVICE, dtype=DTYPE)
 
     torch.manual_seed(7)
-    hidden_states = torch.randn(10, config.hidden_size)
+    hidden_states = torch.randn(10, config.hidden_size, device=DEVICE, dtype=DTYPE)
     routing_weights, selected_experts, router_logits = router(hidden_states)
 
     # Verify selected experts match top-k of the raw logits
@@ -205,7 +215,7 @@ def test_router_top_k():
     if hf is not None:
         HFConfig, HFRouter = hf[0], hf[1]
         hf_cfg = _make_hf_config(hidden_size=128, num_experts=8, num_experts_per_tok=2)
-        hf_router = HFRouter(hf_cfg)
+        hf_router = HFRouter(hf_cfg).to(device=DEVICE, dtype=DTYPE)
         with torch.no_grad():
             hf_router.weight.copy_(router.gate.weight)
         hf_logits, hf_scores, hf_indices = hf_router(hidden_states)
@@ -235,13 +245,13 @@ def test_moe_output():
 
     # --- reference comparison -----------------------------------------------
     torch.manual_seed(42)
-    ref_moe = RefSparseMoE(config)
-    student_moe = OlMoESparseMoE(config)
+    ref_moe = RefSparseMoE(config).to(device=DEVICE, dtype=DTYPE)
+    student_moe = OlMoESparseMoE(config).to(device=DEVICE, dtype=DTYPE)
     student_moe.load_state_dict(ref_moe.state_dict())
 
     batch_size, seq_len = 2, 10
     torch.manual_seed(0)
-    hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
+    hidden_states = torch.randn(batch_size, seq_len, config.hidden_size, device=DEVICE, dtype=DTYPE)
 
     with torch.no_grad():
         ref_out, ref_logits = ref_moe(hidden_states)
@@ -255,9 +265,9 @@ def test_moe_output():
         "dispatch loop in OlMoESparseMoE.forward()?"
     )
 
-    assert torch.allclose(student_logits, ref_logits, atol=1e-6), \
+    assert torch.allclose(student_logits, ref_logits, atol=ATOL, rtol=RTOL), \
         f"Router logits differ from reference (max diff {(student_logits - ref_logits).abs().max():.2e})"
-    assert torch.allclose(student_out, ref_out, atol=1e-5), \
+    assert torch.allclose(student_out, ref_out, atol=ATOL, rtol=RTOL), \
         f"SparseMoE output differs from reference (max diff {(student_out - ref_out).abs().max():.2e})"
 
     print("  (matches reference olmoe implementation)")
@@ -271,7 +281,7 @@ def test_moe_output():
         hidden_size=128, intermediate_size=512,
         num_experts=8, num_experts_per_tok=2,
     )
-    hf_block = HFMoeBlock(hf_cfg)
+    hf_block = HFMoeBlock(hf_cfg).to(device=DEVICE, dtype=DTYPE)
 
     with torch.no_grad():
         hf_block.gate.weight.copy_(student_moe.router.gate.weight)
@@ -303,7 +313,7 @@ def test_moe_output():
         hf_ref_output.index_add_(0, token_indices, expert_out * weights)
     hf_ref_output = hf_ref_output.view(batch_size, seq_len, config.hidden_size)
 
-    assert torch.allclose(student_out, hf_ref_output, atol=1e-5), \
+    assert torch.allclose(student_out, hf_ref_output, atol=ATOL, rtol=RTOL), \
         f"SparseMoE output differs from HF-expert reference (max diff {(student_out - hf_ref_output).abs().max():.2e})"
 
     print("  (matches HF OlmoeSparseMoeBlock expert computation)")
@@ -337,8 +347,8 @@ def test_moe_output_matches_hf_official_block():
     )
 
     torch.manual_seed(42)
-    student_moe = OlMoESparseMoE(config).eval()
-    hf_block = HFMoeBlock(hf_cfg).eval()
+    student_moe = OlMoESparseMoE(config).to(device=DEVICE, dtype=DTYPE).eval()
+    hf_block = HFMoeBlock(hf_cfg).to(device=DEVICE, dtype=DTYPE).eval()
 
     # Copy student weights -> HF block
     with torch.no_grad():
@@ -351,7 +361,7 @@ def test_moe_output_matches_hf_official_block():
             hf_block.experts.down_proj.data[i] = expert.down_proj.weight
 
     torch.manual_seed(0)
-    hidden_states = torch.randn(2, 10, config.hidden_size)
+    hidden_states = torch.randn(2, 10, config.hidden_size, device=DEVICE, dtype=DTYPE)
 
     with torch.no_grad():
         student_out, student_router_logits = student_moe(hidden_states)
@@ -366,7 +376,7 @@ def test_moe_output_matches_hf_official_block():
 
     assert student_out.shape == hf_out.shape, \
         f"Shape mismatch: student {student_out.shape} vs HF {hf_out.shape}"
-    assert torch.allclose(student_out, hf_out, atol=1e-5), \
+    assert torch.allclose(student_out, hf_out, atol=ATOL, rtol=RTOL), \
         f"Student MoE output differs from HF block (max diff {(student_out - hf_out).abs().max():.2e})"
 
     # Router logits should match when exposed by the HF block.
@@ -376,7 +386,7 @@ def test_moe_output_matches_hf_official_block():
             hf_router_logits = hf_router_logits.view(-1, hf_router_logits.size(-1))
         assert hf_router_logits.shape == expected_shape, \
             f"Router logits shape mismatch: student {expected_shape} vs HF {hf_router_logits.shape}"
-        assert torch.allclose(student_router_logits, hf_router_logits, atol=1e-6), \
+        assert torch.allclose(student_router_logits, hf_router_logits, atol=ATOL, rtol=RTOL), \
             f"Router logits differ from HF block (max diff {(student_router_logits - hf_router_logits).abs().max():.2e})"
 
     print("✓ Student MoE matches HF OlmoeSparseMoeBlock forward")
@@ -394,7 +404,7 @@ def test_load_balancing():
     num_tokens = 80
 
     torch.manual_seed(123)
-    gate_logits = torch.randn(num_tokens, num_experts)
+    gate_logits = torch.randn(num_tokens, num_experts, device=DEVICE, dtype=DTYPE)
 
     student_loss = compute_load_balancing_loss(gate_logits, num_experts, top_k)
 
@@ -405,7 +415,7 @@ def test_load_balancing():
 
     # Must match the reference implementation
     ref_loss = ref_compute_load_balancing_loss(gate_logits, num_experts, top_k)
-    assert torch.allclose(student_loss, ref_loss, atol=1e-6), \
+    assert torch.allclose(student_loss.float(), ref_loss.float(), atol=ATOL, rtol=RTOL), \
         (f"Load-balancing loss mismatch vs reference: student={student_loss.item():.6e}, "
          f"ref={ref_loss.item():.6e}, diff={abs(student_loss.item() - ref_loss.item()):.2e}")
 
@@ -416,7 +426,7 @@ def test_load_balancing():
     if hf is not None:
         _, _, _, _, hf_loss_func = hf
         hf_loss = hf_loss_func((gate_logits,), num_experts=num_experts, top_k=top_k)
-        assert torch.allclose(student_loss, hf_loss, atol=1e-5), \
+        assert torch.allclose(student_loss.float(), hf_loss.float(), atol=ATOL, rtol=RTOL), \
             (f"Load-balancing loss mismatch vs HF: student={student_loss.item():.6e}, "
              f"HF={hf_loss.item():.6e}")
         print("  (matches HF load_balancing_loss_func)")
@@ -435,13 +445,13 @@ def test_moe_block_aux_loss():
     )
 
     torch.manual_seed(42)
-    ref_block = RefMoEBlock(config)
-    student_block = OlMoEMoEBlock(config)
+    ref_block = RefMoEBlock(config).to(device=DEVICE, dtype=DTYPE)
+    student_block = OlMoEMoEBlock(config).to(device=DEVICE, dtype=DTYPE)
     student_block.load_state_dict(ref_block.state_dict())
 
     batch_size, seq_len = 4, 20
     torch.manual_seed(0)
-    hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
+    hidden_states = torch.randn(batch_size, seq_len, config.hidden_size, device=DEVICE, dtype=DTYPE)
 
     with torch.no_grad():
         ref_output, ref_aux = ref_block(hidden_states)
@@ -454,9 +464,9 @@ def test_moe_block_aux_loss():
 
     # Must match the reference implementation
     with torch.no_grad():
-        assert torch.allclose(output, ref_output, atol=1e-5), \
+        assert torch.allclose(output, ref_output, atol=ATOL, rtol=RTOL), \
             f"MoEBlock output differs from reference (max diff {(output - ref_output).abs().max():.2e})"
-        assert torch.allclose(aux_loss, ref_aux, atol=1e-6), \
+        assert torch.allclose(aux_loss.float(), ref_aux.float(), atol=ATOL, rtol=RTOL), \
             (f"MoEBlock aux_loss ({aux_loss.item():.6e}) differs from reference "
              f"({ref_aux.item():.6e})")
 
@@ -467,7 +477,7 @@ def test_moe_block_aux_loss():
         _, router_logits = student_block.moe(hidden_states)
     raw_loss = compute_load_balancing_loss(router_logits, config.num_experts, config.num_experts_per_tok)
     expected_aux = config.router_aux_loss_coef * raw_loss
-    assert torch.allclose(aux_loss, expected_aux, atol=1e-6), \
+    assert torch.allclose(aux_loss.float(), expected_aux.float(), atol=ATOL, rtol=RTOL), \
         (f"MoEBlock aux_loss ({aux_loss.item():.6e}) != "
          f"router_aux_loss_coef * raw_loss ({expected_aux.item():.6e})")
 
@@ -477,7 +487,7 @@ def test_moe_block_aux_loss():
         _, _, _, _, hf_loss_func = hf
         hf_raw = hf_loss_func((router_logits,), num_experts=config.num_experts, top_k=config.num_experts_per_tok)
         hf_expected = config.router_aux_loss_coef * hf_raw
-        assert torch.allclose(aux_loss, hf_expected, atol=1e-5), \
+        assert torch.allclose(aux_loss.float(), hf_expected.float(), atol=ATOL, rtol=RTOL), \
             (f"MoEBlock aux_loss ({aux_loss.item():.6e}) differs from HF "
              f"({hf_expected.item():.6e})")
         print("  (verified aux_loss matches HF load_balancing_loss_func)")
@@ -493,10 +503,10 @@ def test_expert_diversity():
         num_experts_per_tok=2,
     )
 
-    router = OlMoERouter(config)
+    router = OlMoERouter(config).to(device=DEVICE, dtype=DTYPE)
 
     torch.manual_seed(0)
-    hidden_states = torch.randn(100, config.hidden_size)
+    hidden_states = torch.randn(100, config.hidden_size, device=DEVICE, dtype=DTYPE)
     _, selected_experts, _ = router(hidden_states)
 
     unique_experts = torch.unique(selected_experts)
@@ -516,12 +526,12 @@ def test_moe_forward_backward():
     )
 
     torch.manual_seed(42)
-    ref_moe = RefSparseMoE(config)
-    student_moe = OlMoESparseMoE(config)
+    ref_moe = RefSparseMoE(config).to(device=DEVICE, dtype=DTYPE)
+    student_moe = OlMoESparseMoE(config).to(device=DEVICE, dtype=DTYPE)
     student_moe.load_state_dict(ref_moe.state_dict())
 
     torch.manual_seed(0)
-    x_student = torch.randn(2, 5, config.hidden_size, requires_grad=True)
+    x_student = torch.randn(2, 5, config.hidden_size, device=DEVICE, dtype=DTYPE, requires_grad=True)
     x_ref = x_student.detach().clone().requires_grad_(True)
 
     out_student, _ = student_moe(x_student)
@@ -537,13 +547,13 @@ def test_moe_forward_backward():
         for param in expert.parameters():
             assert param.grad is not None, "Expert parameters should have gradients"
 
-    assert torch.allclose(x_student.grad, x_ref.grad, atol=1e-5), \
+    assert torch.allclose(x_student.grad, x_ref.grad, atol=ATOL, rtol=RTOL), \
         f"Input gradients differ from reference (max diff {(x_student.grad - x_ref.grad).abs().max():.2e})"
 
     for (s_name, s_param), (r_name, r_param) in zip(
         student_moe.named_parameters(), ref_moe.named_parameters()
     ):
-        assert torch.allclose(s_param.grad, r_param.grad, atol=1e-5), \
+        assert torch.allclose(s_param.grad, r_param.grad, atol=ATOL, rtol=RTOL), \
             f"Gradient mismatch for {s_name} (max diff {(s_param.grad - r_param.grad).abs().max():.2e})"
 
     print("✓ MoE forward-backward test passed! (gradients match reference)")
