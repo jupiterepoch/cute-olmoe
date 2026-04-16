@@ -264,10 +264,8 @@ def test_moe_output():
 
     # --- HF comparison (optional) -------------------------------------------
     hf = _try_import_hf()
-    if hf is None:
-        print("✓ MoE output test passed!")
-        return
-
+    assert hf is not None, "HF is not installed"
+    
     HFConfig, HFRouter, HFMoeBlock, HFExperts, _ = hf
     hf_cfg = _make_hf_config(
         hidden_size=128, intermediate_size=512,
