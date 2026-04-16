@@ -17,6 +17,7 @@ import sys
 import os
 import pytest
 import torch
+from dataclasses import dataclass
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -29,32 +30,14 @@ HF_MODEL_ID = "allenai/OLMoE-1B-7B-0924"
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(scope="module")
-def hf_config():
-    """Load the HF OLMoE config (no weights downloaded)."""
-    from transformers import AutoConfig
-    obj = AutoConfig.from_pretrained(HF_MODEL_ID)
-    obj.norm_topk_prob = True
-    print(obj.__dict__)
-    return obj
+@dataclass(frozen=True)
+class _ConfigBundle:
+    hf: object
+    student: object
 
 
-@pytest.fixture(scope="module")
-def hf_model(hf_config):
-    """Load the full HF OLMoE model with pretrained weights."""
-    from transformers import OlmoeForCausalLM
-    model = OlmoeForCausalLM.from_pretrained(
-        HF_MODEL_ID,
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-    )
-    model.eval()
-    return model
-
-
-@pytest.fixture(scope="module")
-def student_config(hf_config):
-    """Build an OlMoEConfig that matches the HF model's hyperparameters."""
+def _student_config_from_hf_config(hf_config):
+    """Build the student config from an HF config object."""
     from olmoe.config import OlMoEConfig
     return OlMoEConfig(
         hidden_size=hf_config.hidden_size,
@@ -69,6 +52,42 @@ def student_config(hf_config):
         rope_theta=hf_config.rope_theta,
         rms_norm_eps=hf_config.rms_norm_eps,
     )
+
+
+@pytest.fixture(scope="module")
+def config_bundle():
+    """Single source of truth for HF + student configs."""
+    from transformers import AutoConfig
+
+    hf_cfg = AutoConfig.from_pretrained(HF_MODEL_ID)
+    hf_cfg.norm_topk_prob = True
+
+    student_cfg = _student_config_from_hf_config(hf_cfg)
+    return _ConfigBundle(hf=hf_cfg, student=student_cfg)
+
+
+@pytest.fixture(scope="module")
+def hf_config(config_bundle):
+    return config_bundle.hf
+
+
+@pytest.fixture(scope="module")
+def hf_model(hf_config):
+    """Load the full HF OLMoE model with pretrained weights."""
+    from transformers import OlmoeForCausalLM
+    model = OlmoeForCausalLM.from_pretrained(
+        HF_MODEL_ID,
+        config=hf_config,
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True,
+    )
+    model.eval()
+    return model
+
+
+@pytest.fixture(scope="module")
+def student_config(config_bundle):
+    return config_bundle.student
 
 
 # ---------------------------------------------------------------------------
