@@ -15,7 +15,7 @@ import math
 
 from .config import OlMoEConfig
 from .embeddings import RotaryEmbedding
-from .utils import apply_rotary_pos_emb
+from .utils import RMSNorm, apply_rotary_pos_emb
 
 
 class OlMoEAttention(nn.Module):
@@ -44,6 +44,9 @@ class OlMoEAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        self.q_norm = RMSNorm(self.num_heads * self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.num_key_value_heads * self.head_dim, eps=config.rms_norm_eps)
 
         self.rotary_emb = RotaryEmbedding(
             self.head_dim,
@@ -93,9 +96,9 @@ class OlMoEAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         batch_size, seq_len, _ = hidden_states.shape
 
-        # Project to Q, K, V
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
+        # Project to Q, K, V and apply QK normalization
+        query_states = self.q_norm(self.q_proj(hidden_states))
+        key_states = self.k_norm(self.k_proj(hidden_states))
         value_states = self.v_proj(hidden_states)
 
         # Split into heads

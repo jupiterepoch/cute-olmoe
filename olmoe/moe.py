@@ -12,7 +12,7 @@ from typing import Tuple
 
 from .config import OlMoEConfig
 from .feedforward import OlMoEFeedForward
-from .utils import compute_load_balancing_loss
+from .utils import compute_load_balancing_loss, get_activation_function
 
 
 class OlMoERouter(nn.Module):
@@ -63,6 +63,7 @@ class OlMoESparseMoE(nn.Module):
 
         self.router = OlMoERouter(config)
         self.experts = nn.ModuleList([OlMoEFeedForward(config) for _ in range(self.num_experts)])
+        self.act_fn = get_activation_function(config.hidden_act)
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -80,36 +81,50 @@ class OlMoESparseMoE(nn.Module):
         # Flatten to (batch * seq_len, hidden_size)
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
+        # grouped_mm expects expert weights in (num_experts, K, N).
+        # nn.Linear stores weights as (N, K), so transpose each expert weight.
+        full_down_proj_weights = torch.stack(
+            [expert.down_proj.weight.transpose(0, 1) for expert in self.experts], dim=0
+        ).contiguous()
+        full_up_proj_weights = torch.stack(
+            [expert.up_proj.weight.transpose(0, 1) for expert in self.experts], dim=0
+        ).contiguous()
+        full_gate_proj_weights = torch.stack(
+            [expert.gate_proj.weight.transpose(0, 1) for expert in self.experts], dim=0
+        ).contiguous()
+
         # Route tokens
         routing_weights, selected_experts, router_logits = self.router(hidden_states_flat)
 
-        # Initialize output accumulator
+        # (num_tokens * top_k)
+        expert_ids = selected_experts.reshape(-1) 
+        token_ids = torch.arange(hidden_states_flat.shape[0], device=hidden_states_flat.device).repeat_interleave(self.top_k)
+        route_w = routing_weights.reshape(-1)
+
+        perm = expert_ids.argsort(stable=True)
+        expert_ids = expert_ids[perm]
+        token_ids = token_ids[perm]
+        route_w = route_w[perm]
+
+        # (num_tokens * top_k, hidden_size)
+        x_grouped = hidden_states_flat.index_select(0, token_ids)
+
+        counts = torch.bincount(expert_ids, minlength=self.num_experts)
+        offs = counts.cumsum(0).to(torch.int32)
+
+        # (num_tokens * top_k, intermediate_size)
+        gate = self.act_fn(F.grouped_mm(x_grouped, full_gate_proj_weights, offs=offs))
+        up = F.grouped_mm(x_grouped, full_up_proj_weights, offs=offs)
+        
+        y_grouped = gate * up
+
+        # (num_tokens * top_k, hidden_size)
+        y_grouped = F.grouped_mm(y_grouped, full_down_proj_weights, offs=offs)
+        y_grouped = y_grouped * route_w.unsqueeze(-1)
+
+        # Initialize output
         final_output = torch.zeros_like(hidden_states_flat)
-
-        # Dispatch tokens to each expert
-        for expert_idx in range(self.num_experts):
-            # Mask: which (token, slot) pairs are assigned to this expert
-            # selected_experts: (num_tokens, top_k)
-            expert_mask = (selected_experts == expert_idx)  # (num_tokens, top_k)
-
-            if not expert_mask.any():
-                continue
-
-            # Get token indices that use this expert (from any top-k slot)
-            token_indices, slot_indices = expert_mask.nonzero(as_tuple=True)
-
-            # Extract those tokens
-            expert_input = hidden_states_flat[token_indices]  # (num_assigned, hidden)
-
-            # Process through expert
-            expert_out = self.experts[expert_idx](expert_input)  # (num_assigned, hidden)
-
-            # Scale by routing weights
-            weights = routing_weights[token_indices, slot_indices].unsqueeze(-1)  # (num_assigned, 1)
-            expert_out = expert_out * weights
-
-            # Accumulate
-            final_output.index_add_(0, token_indices, expert_out)
+        final_output.index_add_(0, token_ids, y_grouped)
 
         # Reshape back
         output = final_output.view(batch_size, seq_len, hidden_dim)

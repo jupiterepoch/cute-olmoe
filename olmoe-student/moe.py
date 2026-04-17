@@ -37,11 +37,7 @@ class OlMoERouter(nn.Module):
         super().__init__()
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
-
-        # TODO: Initialize router linear layer
-        # Input: hidden_size, Output: num_experts
-        # No bias needed
-        self.gate = None  # TODO: nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -55,18 +51,16 @@ class OlMoERouter(nn.Module):
             - routing_weights: Normalized weights for selected experts (batch*seq, top_k)
             - selected_experts: Indices of selected experts (batch*seq, top_k)
             - router_logits: Raw logits for all experts (batch*seq, num_experts)
-
-        TODO: Implement routing logic
-        Steps:
-        1. Compute router logits: gate(hidden_states)
-        2. Select top-k experts per token using torch.topk
-        3. Compute routing probabilities: softmax over selected expert logits
-        4. Return (routing_weights, selected_experts, router_logits)
-
-        Note: Router logits are returned for computing load balancing loss
         """
-        # TODO: Implement routing
-        pass
+        # (BS, num_experts)
+        router_logits = self.gate(hidden_states) 
+
+        # (BS, top_k)
+        top_k_logits, selected_experts = torch.topk(router_logits, self.top_k, dim=-1)
+        routing_weights = F.softmax(top_k_logits, dim=-1)
+    
+        # Router logits are returned for computing load balancing loss
+        return routing_weights, selected_experts, router_logits
 
 
 class OlMoESparseMoE(nn.Module):
@@ -91,12 +85,8 @@ class OlMoESparseMoE(nn.Module):
         self.hidden_size = config.hidden_size
         self.router_aux_loss_coef = config.router_aux_loss_coef
 
-        # TODO: Initialize router
-        self.router = None  # TODO: OlMoERouter(config)
-
-        # TODO: Initialize experts
-        # Create a list (nn.ModuleList) of num_experts feed-forward networks
-        self.experts = None  # TODO: nn.ModuleList([OlMoEFeedForward(config) for _ in range(self.num_experts)])
+        self.router = OlMoERouter(config)
+        self.experts = nn.ModuleList([OlMoEFeedForward(config) for _ in range(self.num_experts)])
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -131,29 +121,32 @@ class OlMoESparseMoE(nn.Module):
         """
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
-        # TODO: Reshape to (batch * seq_len, hidden_size)
-        # hidden_states = hidden_states.view(-1, hidden_dim)
+        # (BS, hidden_size)
+        hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # TODO: Route tokens
-        # routing_weights, selected_experts, router_logits = self.router(hidden_states)
+        # (BS, top_k)
+        routing_weights, selected_experts, router_logits = self.router(hidden_states)
 
-        # TODO: Initialize output
-        # final_output = torch.zeros_like(hidden_states)
+        # (BS, hidden_size)
+        final_output = torch.zeros_like(hidden_states)
 
-        # TODO: Process tokens through experts
-        # Strategy 1: Loop over experts
-        # for expert_idx in range(self.num_experts):
-        #     # Find tokens assigned to this expert
-        #     expert_mask = (selected_experts == expert_idx)
-        #     if expert_mask.any():
-        #         # Extract token indices and weights
-        #         # Process through expert
-        #         # Add to output
+        # Process tokens through experts
+        for expert_idx in range(self.num_experts):
+            # Find tokens assigned to this expert
+            expert_mask = (selected_experts == expert_idx)
+            if expert_mask.any():
+                token_indices, slot_indices = expert_mask.nonzero(as_tuple=True)
+                
+                expert_tokens = hidden_states[token_indices] # (BS, hidden_size)
+                expert_output = self.experts[expert_idx](expert_tokens) # (BS, hidden_size)
+                expert_routing_weights = routing_weights[token_indices, slot_indices].unsqueeze(-1) # (BS, 1)
 
-        # TODO: Reshape output back to (batch_size, seq_len, hidden_size)
+                # Add back to final output weighted by routing weights
+                final_output.index_add_(0, token_indices, expert_output * expert_routing_weights)
 
-        # TODO: Return output and router_logits
-        pass
+        final_output = final_output.view(batch_size, seq_len, hidden_dim)
+
+        return final_output, router_logits
 
 
 class OlMoEMoEBlock(nn.Module):
@@ -181,16 +174,11 @@ class OlMoEMoEBlock(nn.Module):
             Tuple of:
             - output: MoE output (batch_size, seq_len, hidden_size)
             - aux_loss: Load balancing auxiliary loss (scalar)
-
-        TODO: Implement forward with aux loss
-        Steps:
-        1. Call self.moe(hidden_states) to get output and router_logits
-        2. Compute load balancing loss using router_logits
-        3. Scale aux_loss by router_aux_loss_coef
-        4. Return output and aux_loss
         """
-        # TODO: Forward through MoE and compute aux loss
-        pass
+        output, router_logits = self.moe(hidden_states)
+        aux_loss = compute_load_balancing_loss(router_logits, self.num_experts, self.top_k)
+        aux_loss = aux_loss * self.router_aux_loss_coef
+        return output, aux_loss
 
 
 # Helper function for debugging
